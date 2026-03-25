@@ -27,22 +27,48 @@ class ClientSettings:
     POLL_BATCH_SIZE: int = int(os.getenv("POLL_BATCH_SIZE", "50"))
     """单次轮询最多拉取的消息数量，默认 50 条。"""
 
+    HTTP_TIMEOUT_SECONDS: float = float(os.getenv("HTTP_TIMEOUT_SECONDS", "10"))
+    """HTTP 请求超时时间（秒），默认 10 秒。"""
+
     # ── OpenClaw Gateway 配置 ───────────────────────────────────────
     OPENCLAW_BASE_URL: str = os.getenv("OPENCLAW_BASE_URL", "http://127.0.0.1:18789")
     """OpenClaw Gateway 地址，默认本机 18789 端口（OpenClaw 默认端口）。"""
 
     OPENCLAW_GATEWAY_TOKEN: str = os.getenv("OPENCLAW_GATEWAY_TOKEN", "")
-    """OpenClaw Gateway 认证 Token（对应 gateway.auth.token 配置项）。"""
+    """OpenClaw Gateway 认证 Token（Bearer Token），对应 gateway.auth.token 配置项。"""
 
-    OPENCLAW_SESSION_KEY: str = os.getenv("OPENCLAW_SESSION_KEY", "main")
-    """目标会话 Key，默认为 'main'（OpenClaw 主会话）。"""
+    OPENCLAW_MODEL: str = os.getenv("OPENCLAW_MODEL", "openclaw")
+    """
+    发送给 POST /v1/responses 的 model 字段值。
+    通常填写 OpenClaw 配置的 model 名称，默认为 'openclaw'。
+    """
+
+    OPENCLAW_SYSTEM_PROMPT: str = os.getenv("OPENCLAW_SYSTEM_PROMPT", "")
+    """
+    可选的系统指令（instructions 字段），将作为 AI 的角色设定。
+    为空则不附加，OpenClaw 使用自身默认的 system prompt。
+    """
 
     OPENCLAW_CHANNEL_HINT: str = os.getenv("OPENCLAW_CHANNEL_HINT", "")
-    """可选：传递给 OpenClaw 的 Channel 上下文提示（如 'wecom'），用于 Group 路由策略。"""
+    """
+    可选的 Channel 标识，将作为 x-openclaw-message-channel 请求头发送，
+    用于 OpenClaw 内部路由到指定 Channel。为空则不附加。
+    """
 
-    # ── HTTP 请求配置 ───────────────────────────────────────────────
-    HTTP_TIMEOUT_SECONDS: float = float(os.getenv("HTTP_TIMEOUT_SECONDS", "10"))
-    """HTTP 请求超时时间（秒），默认 10 秒。"""
+    OPENCLAW_TIMEOUT_SECONDS: float = float(os.getenv("OPENCLAW_TIMEOUT_SECONDS", "60"))
+    """
+    调用 OpenClaw /v1/responses 的超时时间（秒）。
+    AI 推理可能耗时较长，建议设置为 60 秒或以上。
+    """
+
+    OPENCLAW_WELCOME_MESSAGE: str = os.getenv(
+        "OPENCLAW_WELCOME_MESSAGE",
+        "您好！我是 AI 智能助手，有什么可以帮您的吗？",
+    )
+    """
+    用户首次进入会话时（enter_chat 事件）发送的欢迎语。
+    该欢迎语不经过 OpenClaw 处理，直接回复给用户。
+    """
 
 
 settings = ClientSettings()

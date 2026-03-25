@@ -2,15 +2,16 @@
 企业微信消息转发系统 - 客户端程序
 功能：
   1. 定时轮询服务端 HTTP 接口，检查是否有新消息
-  2. 获取到新消息后，通过 OpenClaw Gateway HTTP API 发送给 OpenClaw
-  3. 标记已处理消息，避免重复发送
+  2. 获取到新消息后，调用 OpenClaw Gateway POST /v1/responses 接口进行 AI 处理
+  3. 将 OpenClaw 返回的处理结果，通过服务端 POST /api/reply 接口回复给企业微信用户
+  4. 标记已处理消息，避免重复发送
 """
 
 import json
 import logging
 import signal
-import sys
 import time
+import uuid
 from typing import Any, Dict, List, Optional, Set
 
 import httpx
@@ -18,7 +19,7 @@ import httpx
 # ─────────────────────────────────────────────
 # 配置加载
 # ─────────────────────────────────────────────
-from config import settings  # noqa: E402  (本地 config.py)
+from config import settings  # noqa: E402
 
 # ─────────────────────────────────────────────
 # 日志配置
@@ -34,14 +35,13 @@ logger = logging.getLogger("wecom-client")
 # 已处理消息 ID 集合（防重复发送）
 # ─────────────────────────────────────────────
 processed_ids: Set[str] = set()
-MAX_PROCESSED_IDS = 5000  # 超出后自动清理最旧的一半，防止内存无限增长
+MAX_PROCESSED_IDS = 5000
 
 
 def _add_processed_id(msg_id: str):
-    """记录已处理的消息 ID，并在超出上限时清理旧记录。"""
+    """记录已处理的消息 ID，超出上限时自动清理旧记录。"""
     global processed_ids
     if len(processed_ids) >= MAX_PROCESSED_IDS:
-        # 简单策略：清空一半（实际生产可用 LRU 或 TTL 机制）
         processed_ids = set(list(processed_ids)[MAX_PROCESSED_IDS // 2:])
     processed_ids.add(msg_id)
 
@@ -50,10 +50,7 @@ def _add_processed_id(msg_id: str):
 # 服务端消息拉取
 # ─────────────────────────────────────────────
 def fetch_messages(client: httpx.Client) -> List[Dict[str, Any]]:
-    """
-    向服务端发起 HTTP GET 请求，拉取未读消息列表。
-    返回消息列表，若请求失败则返回空列表。
-    """
+    """向服务端发起 HTTP GET 请求，拉取未读消息列表。"""
     url = f"{settings.SERVER_BASE_URL}/api/messages"
     params = {"limit": settings.POLL_BATCH_SIZE, "clear": "true"}
     try:
@@ -79,112 +76,244 @@ def fetch_messages(client: httpx.Client) -> List[Dict[str, Any]]:
 
 
 # ─────────────────────────────────────────────
-# OpenClaw 消息发送
+# 调用 OpenClaw /v1/responses
 # ─────────────────────────────────────────────
-def build_openclaw_payload(message: Dict[str, Any]) -> Dict[str, Any]:
+def call_openclaw(client: httpx.Client, message: Dict[str, Any]) -> Optional[str]:
     """
-    将企业微信消息转换为 OpenClaw Gateway 接受的消息格式。
+    将消息内容发送到 OpenClaw Gateway POST /v1/responses 接口。
+    返回 AI 处理后的文本结果，失败时返回 None。
 
-    OpenClaw Gateway 支持两种注入方式：
-      1. /tools/invoke  → 调用内置工具（如 chat_send）
-      2. /api/channels/<channel>/inject → 直接向指定 Channel 注入消息（部分版本支持）
-
-    本实现默认使用 /tools/invoke 方式，通过 chat_send 工具注入消息。
+    /v1/responses 遵循 OpenResponses API 规范：
+    - 请求体：{"model": "openclaw", "input": "<用户消息>", "user": "<会话标识>"}
+    - 响应体：{"output": [{"content": [{"type": "output_text", "text": "..."}]}]}
     """
     content = message.get("content", "")
-    from_user = message.get("from_userid", "unknown")
-    msg_type = message.get("msgtype", "text")
+    from_userid = message.get("from_userid", "unknown")
+    chatid = message.get("chatid", "")
     chattype = message.get("chattype", "single")
+    msgtype = message.get("msgtype", "text")
 
-    # 构造发送给 OpenClaw 的消息文本（可根据需要自定义格式）
-    if msg_type == "event":
-        formatted_text = content
-    else:
-        formatted_text = (
-            f"[来自企业微信]\n"
-            f"发送人: {from_user}\n"
-            f"会话类型: {'群聊' if chattype == 'group' else '单聊'}\n"
-            f"消息类型: {msg_type}\n"
-            f"内容: {content}"
-        )
+    # 事件类消息（如 enter_chat）不需要调用 AI，直接返回欢迎语
+    if msgtype == "event":
+        event_type = message.get("event_type", "")
+        if event_type == "enter_chat":
+            return settings.OPENCLAW_WELCOME_MESSAGE
+        # 其他事件不回复
+        return None
 
-    # 使用 /tools/invoke 接口的 chat_send 工具
-    return {
-        "tool": "chat_send",
-        "args": {
-            "message": formatted_text,
-        },
-        "sessionKey": settings.OPENCLAW_SESSION_KEY,
+    # 构造发送给 OpenClaw 的用户消息
+    # 使用 chatid（群聊）或 userid（单聊）作为稳定的 session 标识
+    session_key = chatid if chattype == "group" and chatid else from_userid
+
+    # 构造请求体（OpenResponses API 格式）
+    payload = {
+        "model": settings.OPENCLAW_MODEL,
+        "input": content,
+        "user": session_key,  # 用于 OpenClaw 内部的稳定会话路由
     }
 
+    # 可选：附加系统指令
+    if settings.OPENCLAW_SYSTEM_PROMPT:
+        payload["instructions"] = settings.OPENCLAW_SYSTEM_PROMPT
 
-def send_to_openclaw(client: httpx.Client, message: Dict[str, Any]) -> bool:
-    """
-    将单条消息发送到 OpenClaw Gateway。
-    返回 True 表示发送成功，False 表示失败。
-    """
-    msg_id = message.get("id", "")
-    msgid = message.get("msgid", "")
-
-    # 防重复：检查消息是否已处理
-    dedup_key = msgid if msgid else msg_id
-    if dedup_key and dedup_key in processed_ids:
-        logger.debug("消息 %s 已处理，跳过", dedup_key)
-        return True
-
-    payload = build_openclaw_payload(message)
-    url = f"{settings.OPENCLAW_BASE_URL}/tools/invoke"
+    url = f"{settings.OPENCLAW_BASE_URL}/v1/responses"
     headers = {
         "Authorization": f"Bearer {settings.OPENCLAW_GATEWAY_TOKEN}",
         "Content-Type": "application/json",
     }
-    # 可选：传递 Channel 上下文头
     if settings.OPENCLAW_CHANNEL_HINT:
         headers["x-openclaw-message-channel"] = settings.OPENCLAW_CHANNEL_HINT
+
+    logger.info(
+        "调用 OpenClaw /v1/responses [from=%s, session=%s, content_len=%d]",
+        from_userid,
+        session_key,
+        len(content),
+    )
 
     try:
         resp = client.post(
             url,
             json=payload,
             headers=headers,
+            timeout=settings.OPENCLAW_TIMEOUT_SECONDS,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+
+        # 从 OpenResponses 格式的响应中提取文本
+        ai_text = _extract_openclaw_text(result)
+        if ai_text:
+            logger.info(
+                "OpenClaw 返回结果 [session=%s, len=%d]: %s...",
+                session_key,
+                len(ai_text),
+                ai_text[:80],
+            )
+            return ai_text
+        else:
+            logger.warning("OpenClaw 响应中未找到文本内容: %s", json.dumps(result, ensure_ascii=False)[:300])
+            return None
+
+    except httpx.ConnectError:
+        logger.warning("无法连接到 OpenClaw Gateway %s", settings.OPENCLAW_BASE_URL)
+        return None
+    except httpx.TimeoutException:
+        logger.warning("调用 OpenClaw /v1/responses 超时（超过 %ds）", settings.OPENCLAW_TIMEOUT_SECONDS)
+        return None
+    except httpx.HTTPStatusError as e:
+        logger.error(
+            "OpenClaw 返回错误状态码 %s: %s",
+            e.response.status_code,
+            e.response.text[:300],
+        )
+        return None
+    except Exception as e:
+        logger.exception("调用 OpenClaw 时发生未知异常: %s", e)
+        return None
+
+
+def _extract_openclaw_text(result: Dict[str, Any]) -> Optional[str]:
+    """
+    从 OpenResponses API 响应中提取文本内容。
+
+    响应结构示例：
+    {
+      "output": [
+        {
+          "type": "message",
+          "content": [
+            {"type": "output_text", "text": "AI 回复内容"}
+          ]
+        }
+      ]
+    }
+    """
+    output = result.get("output", [])
+    texts = []
+    for item in output:
+        if item.get("type") == "message":
+            for part in item.get("content", []):
+                if part.get("type") == "output_text":
+                    text = part.get("text", "").strip()
+                    if text:
+                        texts.append(text)
+    if texts:
+        return "\n".join(texts)
+
+    # 兼容其他可能的响应格式
+    if "text" in result:
+        return result["text"].strip()
+    if "content" in result:
+        return str(result["content"]).strip()
+
+    return None
+
+
+# ─────────────────────────────────────────────
+# 将 OpenClaw 结果回复给企业微信（通过服务端）
+# ─────────────────────────────────────────────
+def reply_to_wecom(
+    client: httpx.Client,
+    message: Dict[str, Any],
+    ai_reply: str,
+) -> bool:
+    """
+    调用服务端 POST /api/reply 接口，将 AI 回复发送回企业微信。
+    服务端会通过 WebSocket 将内容回复给原始用户。
+    返回 True 表示成功，False 表示失败。
+    """
+    req_id = message.get("req_id", "")
+    msgid = message.get("msgid", "")
+    is_welcome = (
+        message.get("msgtype") == "event"
+        and message.get("event_type") == "enter_chat"
+    )
+
+    if not req_id:
+        logger.warning("消息缺少 req_id，无法回复 [msgid=%s]", msgid)
+        return False
+
+    url = f"{settings.SERVER_BASE_URL}/api/reply"
+    payload = {
+        "req_id": req_id,
+        "content": ai_reply,
+        "is_welcome": is_welcome,
+        "stream_id": str(uuid.uuid4()).replace("-", ""),
+        "finish": True,
+    }
+
+    try:
+        resp = client.post(
+            url,
+            json=payload,
             timeout=settings.HTTP_TIMEOUT_SECONDS,
         )
         resp.raise_for_status()
         result = resp.json()
-        if result.get("ok", False):
+        if result.get("status") == "success":
             logger.info(
-                "消息已成功发送到 OpenClaw [msgid=%s, from=%s]",
+                "已成功回复企业微信用户 [msgid=%s, req_id=%s, reply_len=%d]",
                 msgid,
-                message.get("from_userid", ""),
+                req_id,
+                len(ai_reply),
             )
-            _add_processed_id(dedup_key)
             return True
         else:
-            logger.error(
-                "OpenClaw 返回失败结果: %s",
-                json.dumps(result, ensure_ascii=False),
-            )
+            logger.error("服务端回复接口返回失败: %s", result)
             return False
     except httpx.ConnectError:
-        logger.warning(
-            "无法连接到 OpenClaw Gateway %s，请检查 Gateway 是否已启动",
-            settings.OPENCLAW_BASE_URL,
-        )
+        logger.warning("无法连接到服务端回复接口 %s", settings.SERVER_BASE_URL)
         return False
     except httpx.TimeoutException:
-        logger.warning("发送消息到 OpenClaw 超时 [msgid=%s]", msgid)
+        logger.warning("调用服务端回复接口超时 [msgid=%s]", msgid)
         return False
     except httpx.HTTPStatusError as e:
         logger.error(
-            "OpenClaw Gateway 返回错误状态码 %s [msgid=%s]: %s",
+            "服务端回复接口返回错误状态码 %s [msgid=%s]: %s",
             e.response.status_code,
             msgid,
             e.response.text[:200],
         )
         return False
     except Exception as e:
-        logger.exception("发送消息到 OpenClaw 时发生未知异常 [msgid=%s]: %s", msgid, e)
+        logger.exception("调用服务端回复接口时发生异常 [msgid=%s]: %s", msgid, e)
         return False
+
+
+# ─────────────────────────────────────────────
+# 处理单条消息的完整流程
+# ─────────────────────────────────────────────
+def process_message(client: httpx.Client, message: Dict[str, Any]) -> bool:
+    """
+    处理单条消息的完整流程：
+      1. 防重复检查
+      2. 调用 OpenClaw /v1/responses 获取 AI 回复
+      3. 调用服务端 /api/reply 将结果回复给企业微信
+    返回 True 表示处理成功，False 表示失败。
+    """
+    msg_id = message.get("id", "")
+    msgid = message.get("msgid", "")
+    dedup_key = msgid if msgid else msg_id
+
+    # 防重复
+    if dedup_key and dedup_key in processed_ids:
+        logger.debug("消息 %s 已处理，跳过", dedup_key)
+        return True
+
+    # 调用 OpenClaw
+    ai_reply = call_openclaw(client, message)
+    if ai_reply is None:
+        logger.warning("OpenClaw 未返回有效结果，跳过回复 [msgid=%s]", msgid)
+        # 仍然标记为已处理，避免无限重试
+        _add_processed_id(dedup_key)
+        return False
+
+    # 回复企业微信
+    ok = reply_to_wecom(client, message, ai_reply)
+    if ok:
+        _add_processed_id(dedup_key)
+    return ok
 
 
 # ─────────────────────────────────────────────
@@ -204,8 +333,8 @@ def run_poll_loop():
     """
     主轮询循环：
       1. 每隔 POLL_INTERVAL_SECONDS 秒向服务端拉取一次消息
-      2. 对每条消息调用 send_to_openclaw 发送
-      3. 统计发送成功/失败数量并记录日志
+      2. 对每条消息执行完整的处理流程（OpenClaw → 企业微信回复）
+      3. 统计成功/失败数量并记录日志
     """
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
@@ -221,22 +350,19 @@ def run_poll_loop():
         while _running:
             poll_start = time.monotonic()
 
-            # 拉取消息
             messages = fetch_messages(http_client)
 
-            # 逐条发送到 OpenClaw
             if messages:
                 success_count = 0
                 fail_count = 0
                 for msg in messages:
                     if not _running:
                         break
-                    ok = send_to_openclaw(http_client, msg)
+                    ok = process_message(http_client, msg)
                     if ok:
                         success_count += 1
                     else:
                         fail_count += 1
-                        # 发送失败时短暂等待后继续（避免瞬间大量失败）
                         time.sleep(0.5)
 
                 logger.info(
@@ -245,7 +371,6 @@ def run_poll_loop():
                     fail_count,
                 )
 
-            # 等待下一个轮询周期（扣除本轮已消耗的时间）
             elapsed = time.monotonic() - poll_start
             sleep_time = max(0.0, settings.POLL_INTERVAL_SECONDS - elapsed)
             if _running and sleep_time > 0:
